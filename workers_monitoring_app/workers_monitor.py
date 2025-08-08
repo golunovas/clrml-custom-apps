@@ -334,8 +334,8 @@ class WorkersMonitor:
         worker_prefix: str,
         gpus: List[str],
         worker_config: Dict[str, int],
-        available_gpus: int
-    ) -> int:
+        available_gpus: float
+    ) -> float:
         '''
         Deduct the number of GPUs already allocated by scanning existing worker permutations.
 
@@ -347,13 +347,22 @@ class WorkersMonitor:
         :return: The new value of 'available_gpus' after deduction.
         '''
         for _, num_gpus in worker_config.items():
-            combinations = list(itertools.permutations(gpus, num_gpus))
-            for combination in combinations:
-                query_worker_suffix = 'gpu' + ','.join(combination)
-                query_worker_id = f'{worker_prefix}:{query_worker_suffix}'
-                # If a worker with this GPU combination exists, it means GPUs are allocated
-                if any(q_worker['id'] == query_worker_id for q_worker in workers):
-                    available_gpus -= num_gpus
+            if num_gpus >= 1:
+                combinations = list(itertools.permutations(gpus, num_gpus))
+                for combination in combinations:
+                    query_worker_suffix = 'gpu' + ','.join(combination)
+                    query_worker_id = f'{worker_prefix}:{query_worker_suffix}'
+                    # If a worker with this GPU combination exists, it means GPUs are allocated
+                    if any(q_worker['id'] == query_worker_id for q_worker in workers):
+                        available_gpus -= num_gpus
+            else:
+                cnt = 0
+                for q_worker in workers:
+                    if 'id' not in q_worker or not q_worker['id'].startswith(worker_prefix) or 'dgpu' in q_worker['id']:
+                        continue
+                    if str(num_gpus) in q_worker['id'].split(':')[1]:
+                        cnt += 1
+                available_gpus -= cnt * num_gpus
         return available_gpus
 
 
