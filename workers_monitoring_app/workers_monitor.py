@@ -346,23 +346,37 @@ class WorkersMonitor:
         :param available_gpus: The total number of GPUs initially available.
         :return: The new value of 'available_gpus' after deduction.
         '''
+        occupied_gpus = set()  # Track which specific GPUs are occupied by fractional allocations
+        
+        # First pass: deduct fractional GPUs and mark them as occupied
+        for _, num_gpus in worker_config.items():
+            if num_gpus < 1:
+                cnt = 0
+                for q_worker in workers:
+                    if 'id' not in q_worker or not q_worker['id'].startswith(worker_prefix) or 'dgpu' in q_worker['id']:
+                        continue
+                    str_suffix = str(num_gpus).replace('0.', '.')  # e.g. 0.5 -> '5'
+                    if str_suffix in q_worker['id'].split(':')[1]:
+                        cnt += 1
+                        # Extract which GPU is being used for this fractional allocation
+                        gpu_suffix = q_worker['id'].split(':')[1]
+                        gpu_id = gpu_suffix.replace('gpu', '').split('.')[0]  # Assuming single GPU for fractional
+                        occupied_gpus.add(gpu_id)
+                available_gpus -= cnt * num_gpus
+
+        # Second pass: deduct whole GPUs, but skip combinations that use occupied GPUs
         for _, num_gpus in worker_config.items():
             if num_gpus >= 1:
                 combinations = list(itertools.permutations(gpus, num_gpus))
                 for combination in combinations:
+                    # Skip this combination if any GPU in it is occupied by fractional allocation
+                    if any(gpu in occupied_gpus for gpu in combination):
+                        continue
                     query_worker_suffix = 'gpu' + ','.join(combination)
                     query_worker_id = f'{worker_prefix}:{query_worker_suffix}'
                     # If a worker with this GPU combination exists, it means GPUs are allocated
                     if any(q_worker['id'] == query_worker_id for q_worker in workers):
                         available_gpus -= num_gpus
-            else:
-                cnt = 0
-                for q_worker in workers:
-                    if 'id' not in q_worker or not q_worker['id'].startswith(worker_prefix) or 'dgpu' in q_worker['id']:
-                        continue
-                    if str(num_gpus) in q_worker['id'].split(':')[1]:
-                        cnt += 1
-                available_gpus -= cnt * num_gpus
         return available_gpus
 
 
