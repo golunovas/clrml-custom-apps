@@ -90,18 +90,25 @@ class WorkersMonitor:
 
             gpus = self._parse_gpus(worker_suffix)
             total_gpus: int = len(gpus)
-            available_gpus: int = total_gpus
 
             worker_config = self._config[worker_id]['queues']
-            available_gpus = self._deduct_allocated_gpus(
-                workers, worker_prefix, gpus, worker_config, available_gpus
+            total_gpus_per_queue = dict()
+            for queue_name, num_gpus in worker_config.items():
+                total_gpus_per_queue[queue_name] = total_gpus // num_gpus
+            
+            available_gpus_per_queue = self._deduct_allocated_gpus_per_queue(
+                workers, worker_prefix, worker_config, total_gpus_per_queue
             )
 
+            # Update global queue stats
             for queue_name, num_gpus in worker_config.items():
                 if queue_name not in global_queues:
-                    global_queues[queue_name] = {'num_available': 0, 'num_total': 0}
-                global_queues[queue_name]['num_available'] += available_gpus // num_gpus
-                global_queues[queue_name]['num_total'] += total_gpus // num_gpus
+                    global_queues[queue_name] = {
+                        'num_available': 0,
+                        'num_total': 0,
+                    }
+                global_queues[queue_name]['num_available'] += available_gpus_per_queue.get(queue_name, 0)
+                global_queues[queue_name]['num_total'] += total_gpus_per_queue.get(queue_name, 0)
 
         return global_queues
 
@@ -328,56 +335,40 @@ class WorkersMonitor:
             return [str(gpu_id) for gpu_id in gpus_range]
         return gpus_str.split(',')
 
-    def _deduct_allocated_gpus(
+    def _deduct_allocated_gpus_per_queue(
         self,
         workers: List[Dict[str, Any]],
         worker_prefix: str,
-        gpus: List[str],
         worker_config: Dict[str, int],
-        available_gpus: float
-    ) -> float:
+        total_gpus_per_queue: Dict[str, int]
+    ) -> Dict[str, float]:
         '''
-        Deduct the number of GPUs already allocated by scanning existing worker permutations.
+        Calculate available GPUs per queue after deducting allocated GPUs.
+        If a GPU is occupied by any queue (fractional or whole), it affects availability for all queues.
 
         :param workers: The list of all workers from ClearML.
         :param worker_prefix: The prefix portion of this worker's ID.
-        :param gpus: The GPU list to check for allocations.
         :param worker_config: Queue config for the current worker (like {'onprem.1xA100': 1, ...}).
-        :param available_gpus: The total number of GPUs initially available.
-        :return: The new value of 'available_gpus' after deduction.
+        :param total_gpus_per_queue: Total workers available per queue (like {'onprem.1xA100': 8, ...}).
+        :return: Dictionary mapping queue names to their available GPU counts.
         '''
-        occupied_gpus = set()  # Track which specific GPUs are occupied by fractional allocations
-        
-        # First pass: deduct fractional GPUs and mark them as occupied
-        for _, num_gpus in worker_config.items():
-            if num_gpus < 1:
-                cnt = 0
-                for q_worker in workers:
-                    if 'id' not in q_worker or not q_worker['id'].startswith(worker_prefix) or 'dgpu' in q_worker['id']:
-                        continue
-                    str_suffix = str(num_gpus).replace('0.', '.')  # e.g. 0.5 -> '5'
-                    if str_suffix in q_worker['id'].split(':')[1]:
-                        cnt += 1
-                        # Extract which GPU is being used for this fractional allocation
-                        gpu_suffix = q_worker['id'].split(':')[1]
-                        gpu_id = gpu_suffix.replace('gpu', '').split('.')[0]  # Assuming single GPU for fractional
-                        occupied_gpus.add(gpu_id)
-                available_gpus -= cnt * num_gpus
+        available_gpus_per_queue = total_gpus_per_queue.copy()
 
-        # Second pass: deduct whole GPUs, but skip combinations that use occupied GPUs
-        for _, num_gpus in worker_config.items():
-            if num_gpus >= 1:
-                combinations = list(itertools.permutations(gpus, num_gpus))
-                for combination in combinations:
-                    # Skip this combination if any GPU in it is occupied by fractional allocation
-                    if any(gpu in occupied_gpus for gpu in combination):
-                        continue
-                    query_worker_suffix = 'gpu' + ','.join(combination)
-                    query_worker_id = f'{worker_prefix}:{query_worker_suffix}'
-                    # If a worker with this GPU combination exists, it means GPUs are allocated
-                    if any(q_worker['id'] == query_worker_id for q_worker in workers):
-                        available_gpus -= num_gpus
-        return available_gpus
+        for q_worker in workers:
+            if 'id' not in q_worker or not q_worker['id'].startswith(worker_prefix) or 'dgpu' in q_worker['id']:
+                continue
+            worker_gpu_suffix = q_worker['id'].split(':gpu')[1]
+            if len(worker_gpu_suffix.split('.')) > 1:
+                queue_val = float('.' + worker_gpu_suffix.split('.')[1][:-1])
+            else:
+                queue_val = len(worker_gpu_suffix.split(','))
+            for queue_name, num_gpus in worker_config.items():
+                if queue_val > num_gpus:
+                    available_gpus_per_queue[queue_name] -= queue_val // num_gpus
+                else:
+                    available_gpus_per_queue[queue_name] -= 1
+                available_gpus_per_queue[queue_name] = max(0, available_gpus_per_queue[queue_name])
+        return available_gpus_per_queue
 
 
 def main() -> None:
