@@ -1,9 +1,23 @@
-import json
 import argparse
-import itertools
+import json
+from dataclasses import dataclass
+from datetime import datetime, date, timezone
 from time import time, sleep
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
 from clearml import Task, TaskTypes
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
+
+@dataclass
+class InteractiveSession:
+    task_id: str
+    username: str
+    queue: str
+    is_idle: bool
+    running_time_days: float
+    avg_gpu_usage: float
 
 
 class WorkersMonitor:
@@ -12,13 +26,38 @@ class WorkersMonitor:
     interactive sessions, and general usage by user.
     '''
 
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(
+            self,
+            config: Dict[str, Any],
+            slack_client: Optional[WebClient] = None,
+            slack_channel: Optional[str] = None,
+            low_gpu_threshold: float = 20.0,
+            slack_notify_hour: int = 12,
+            slack_notify_weekday: Optional[int] = 0,
+            min_session_days: float = 1.0,
+    ) -> None:
         '''
         Initialize the WorkersMonitor with a configuration dictionary.
 
         :param config: A dictionary that maps worker IDs to their corresponding queue configuration.
+        :param slack_client: Optional Slack WebClient for sending low-utilization alerts.
+        :param slack_channel: Slack channel ID or name to post alerts to.
+        :param low_gpu_threshold: Avg GPU usage % below which a session is considered underutilized.
+        :param slack_notify_hour: UTC hour (0-23) at which to send the daily Slack alert.
+        :param slack_notify_weekday: If set (0=Mon…6=Sun), only notify on that weekday; otherwise Mon-Fri.
+        :param min_session_days: Minimum session age in days before it is eligible for alerting.
         '''
         self._config = config
+        self._slack_client = slack_client
+        self._slack_channel = slack_channel
+        self._low_gpu_threshold = low_gpu_threshold
+        self._slack_notify_hour = slack_notify_hour
+        self._slack_notify_weekday = slack_notify_weekday
+        self._min_session_days = min_session_days
+        self._slack_last_notified_date: Optional[date] = None
+        self._slack_user_cache: Dict[str, str] = {}
+        if self._slack_client:
+            self._init_slack_user_cache()
 
     def monitor(self, pool_period: float = 60.0) -> None:
         '''
@@ -48,8 +87,10 @@ class WorkersMonitor:
             global_queues = self._calculate_queue_availability(workers)
             self._report_queue_availability(global_queues)
 
-            interactive_sessions_table = self._identify_interactive_sessions(workers)
-            self._report_interactive_sessions(interactive_sessions_table)
+            interactive_sessions = self._identify_interactive_sessions(workers)
+            self._report_interactive_sessions(interactive_sessions)
+            if self._slack_client and self._slack_channel and self._should_notify_slack_now():
+                self._notify_slack_low_utilization(interactive_sessions)
 
             usage_by_user = self._collect_usage_by_user(workers)
             self._report_usage_by_user(usage_by_user)
@@ -59,7 +100,7 @@ class WorkersMonitor:
             return
 
     def _calculate_queue_availability(
-        self, workers: List[Dict[str, Any]]
+            self, workers: List[Dict[str, Any]]
     ) -> Dict[str, Dict[str, int]]:
         '''
         Calculate the number of available and total workers for each queue based on GPU usage.
@@ -95,7 +136,7 @@ class WorkersMonitor:
             total_gpus_per_queue = dict()
             for queue_name, num_gpus in worker_config.items():
                 total_gpus_per_queue[queue_name] = total_gpus // num_gpus
-            
+
             available_gpus_per_queue = self._deduct_allocated_gpus_per_queue(
                 workers, worker_prefix, worker_config, total_gpus_per_queue
             )
@@ -141,61 +182,124 @@ class WorkersMonitor:
             table_plot=queues_availability_table,
         )
 
-    def _identify_interactive_sessions(self, workers: List[Dict[str, Any]]) -> List[List[Any]]:
+    def _identify_interactive_sessions(self, workers: List[Dict[str, Any]]) -> List[InteractiveSession]:
         '''
-        Build an interactive sessions information table by scanning for tasks named 'Interactive Session'.
+        Build a list of interactive sessions by scanning for tasks named 'Interactive Session'.
 
         :param workers: Worker list from ClearML.
-        :return: A table of interactive session info ready for reporting.
+        :return: A list of InteractiveSession objects.
         '''
-        interactive_sessions_table: List[List[Any]] = [
-            ['Task ID', 'Username', 'Queue', 'Idle (GPU<80 & CPU<30)', 'Running Time (Days)', 'Avg GPU usage 7 days']
-        ]
+        sessions: List[InteractiveSession] = []
 
         for worker in workers:
             if 'task' not in worker or 'user' not in worker:
                 continue
 
-            username: str = worker['user']['name']
-            task_id: str = worker['task']['id']
             task_name: str = worker['task']['name']
-            running_time_msec: int = worker['task']['running_time']
-            running_time_days: float = running_time_msec / (1000 * 60 * 60 * 24) # 24 hours in msec
-
             if task_name != 'Interactive Session':
                 continue
 
-            queue_name: str = self._get_queue_by_task_id(task_id)
-            is_idle: bool = worker['is_idle']
-            avg_gpu_usage: float = self._get_avg_gpu_usage_7d_by_worker_id(worker['id'])
-            interactive_sessions_table.append(
-                [
-                    task_id,
-                    username,
-                    queue_name,
-                    is_idle,
-                    f'{running_time_days:.2f}',
-                    avg_gpu_usage,
-                ]
-            )
+            task_id: str = worker['task']['id']
+            running_time_days: float = worker['task']['running_time'] / (1000 * 60 * 60 * 24)
+            sessions.append(InteractiveSession(
+                task_id=task_id,
+                username=worker['user']['name'],
+                queue=self._get_queue_by_task_id(task_id),
+                is_idle=worker['is_idle'],
+                running_time_days=running_time_days,
+                avg_gpu_usage=self._get_avg_gpu_usage_7d_by_worker_id(worker['id']),
+            ))
 
-        return interactive_sessions_table
+        return sessions
 
-    def _report_interactive_sessions(self, sessions_table: List[List[Any]]) -> None:
+    def _report_interactive_sessions(self, sessions: List[InteractiveSession]) -> None:
         '''
         Logs the interactive sessions table to ClearML.
 
-        :param sessions_table: Data table about running interactive sessions from _identify_interactive_sessions.
+        :param sessions: List of InteractiveSession objects from _identify_interactive_sessions.
         '''
+        table = [
+            ['Task ID', 'Username', 'Queue', 'Idle (GPU<80 & CPU<30)', 'Running Time (Days)', 'Avg GPU usage 7 days']]
+        for s in sessions:
+            table.append(
+                [s.task_id, s.username, s.queue, s.is_idle, f'{s.running_time_days:.2f}', f'{s.avg_gpu_usage:.2f}'])
         Task.current_task().get_logger().report_table(
             title='interactive_sessions',
             series='sessions',
             iteration=0,
-            table_plot=sessions_table,
+            table_plot=table,
         )
 
+    def _should_notify_slack_now(self) -> bool:
+        '''
+        Returns True if a Slack notification should be sent right now, False otherwise.
+
+        Conditions (all must hold):
+          - Current UTC weekday is Monday–Friday (weekday < 5).
+          - If slack_notify_weekday is set, the current weekday must match it exactly.
+          - Current UTC hour has reached slack_notify_hour.
+          - A notification has not already been sent today (tracked via _slack_last_notified_date).
+
+        When all conditions are met, _slack_last_notified_date is updated to today so subsequent
+        calls within the same UTC calendar day return False.
+        '''
+        now = datetime.now(timezone.utc)
+        if now.weekday() >= 5:
+            return False
+        if self._slack_notify_weekday is not None and now.weekday() != self._slack_notify_weekday:
+            return False
+        if now.hour < self._slack_notify_hour:
+            return False
+        today = now.date()
+        if self._slack_last_notified_date == today:
+            return False
+        self._slack_last_notified_date = today
+        return True
+
+    def _init_slack_user_cache(self) -> None:
+        try:
+            response = self._slack_client.users_list()
+            for member in response['members']:
+                if member.get('deleted') or member.get('is_bot'):
+                    continue
+                user_id: str = member['id']
+                real_name: str = member.get('real_name', '')
+                display_name: str = member.get('profile', {}).get('display_name', '')
+                if real_name:
+                    self._slack_user_cache[real_name.lower()] = user_id
+                if display_name:
+                    self._slack_user_cache[display_name.lower()] = user_id
+        except SlackApiError as e:
+            print(f'Failed to fetch Slack users: {e}')
+
+    def _get_slack_mention(self, username: str) -> str:
+        user_id = self._slack_user_cache.get(username.lower())
+        return f'<@{user_id}>' if user_id else username
+
+    def _notify_slack_low_utilization(self, sessions: List[InteractiveSession]) -> None:
+        low_sessions = [
+            s for s in sessions
+            if s.running_time_days >= self._min_session_days and 0 <= s.avg_gpu_usage < self._low_gpu_threshold
+        ]
+        if not low_sessions:
+            return
+
+        lines = [
+            f'*Low GPU utilization alert* — sessions below {self._low_gpu_threshold:.0f}% avg GPU usage (7-day avg):']
+        for s in low_sessions:
+            mention = self._get_slack_mention(s.username)
+            lines.append(
+                f'• {mention} — Task `{s.task_id[:16]}...` on `{s.queue}` — Avg GPU: {s.avg_gpu_usage:.1f}% — Running: {s.running_time_days:.2f} days'
+            )
+
+        try:
+            print('Posting Slack alert:\n' + '\n'.join(lines))
+            self._slack_client.chat_postMessage(channel=self._slack_channel, text='\n'.join(lines))
+        except SlackApiError as e:
+            print(f'Failed to send Slack message: {e}')
+
     def _collect_usage_by_user(
-        self, workers: List[Dict[str, Any]]
+            self, workers: List[Dict[str, Any]]
     ) -> Dict[str, Dict[str, Any]]:
         '''
         Aggregates the usage info by user across all workers.
@@ -336,11 +440,11 @@ class WorkersMonitor:
         return gpus_str.split(',')
 
     def _deduct_allocated_gpus_per_queue(
-        self,
-        workers: List[Dict[str, Any]],
-        worker_prefix: str,
-        worker_config: Dict[str, int],
-        total_gpus_per_queue: Dict[str, int]
+            self,
+            workers: List[Dict[str, Any]],
+            worker_prefix: str,
+            worker_config: Dict[str, int],
+            total_gpus_per_queue: Dict[str, int]
     ) -> Dict[str, float]:
         '''
         Calculate available GPUs per queue after deducting allocated GPUs.
@@ -375,17 +479,40 @@ def main() -> None:
     '''
     Main entry point for the script.
     '''
+
+    # fmt: off
     parser = argparse.ArgumentParser(description='ClearML Monitoring Available Workers')
     parser.add_argument('--period', type=int, help='Poll period in seconds', default=60)
     parser.add_argument('--config', type=str, help='Config', required=True)
+    parser.add_argument('--slack-token', type=str, help='Slack bot token', default=None)
+    parser.add_argument('--slack-channel', type=str, help='Slack channel to post alerts to', default=None)
+    parser.add_argument('--gpu-threshold', type=float, help='Avg GPU usage %% below which a session is alerted',
+                        default=20.0)
+    parser.add_argument('--slack-notify-hour', type=int,
+                        help='UTC hour (0-23) at which to send the Slack alert (default: 12)', default=12)
+    parser.add_argument('--slack-notify-weekday', type=int,
+                        help='Weekday to notify on (0=Mon…6=Sun); default: 0 (Monday)', default=0)
+    parser.add_argument('--min-session-days', type=float, default=1.0,
+                        help='Minimum session age in days before it is eligible for Slack alerting (default: 1.0)')
     args = parser.parse_args()
-    
-    cfg = json.loads(args.config)
+    # fmt: on
 
-    task = Task.init(project_name='DevOps', task_name='Workers monitor', task_type=TaskTypes.monitor)
+    cfg = json.loads(json.loads(args.config))
+
+    task = Task.init(project_name='DevOps', task_name='Workers monitor (TMP VUSAL)', task_type=TaskTypes.monitor)
     task.connect(cfg)
 
-    workers_monitor = WorkersMonitor(cfg)
+    slack_client = WebClient(token=args.slack_token) if args.slack_token else None
+
+    workers_monitor = WorkersMonitor(
+        cfg,
+        slack_client=slack_client,
+        slack_channel=args.slack_channel,
+        low_gpu_threshold=args.gpu_threshold,
+        slack_notify_hour=args.slack_notify_hour,
+        slack_notify_weekday=args.slack_notify_weekday,
+        min_session_days=args.min_session_days,
+    )
     workers_monitor.monitor(pool_period=float(args.period))
 
 
