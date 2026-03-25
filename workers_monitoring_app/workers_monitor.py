@@ -258,22 +258,31 @@ class WorkersMonitor:
 
     def _init_slack_user_cache(self) -> None:
         try:
-            response = self._slack_client.users_list()
-            for member in response['members']:
-                if member.get('deleted') or member.get('is_bot'):
-                    continue
-                user_id: str = member['id']
-                real_name: str = member.get('real_name', '')
-                display_name: str = member.get('profile', {}).get('display_name', '')
-                if real_name:
-                    self._slack_user_cache[real_name.lower()] = user_id
-                if display_name:
-                    self._slack_user_cache[display_name.lower()] = user_id
+            cursor = None
+            while True:
+                response = self._slack_client.users_list(limit=200, cursor=cursor)
+                for member in response['members']:
+                    if member.get('deleted') or member.get('is_bot'):
+                        continue
+                    user_id: str = member['id']
+                    real_name: str = member.get('real_name', '')
+                    display_name: str = member.get('profile', {}).get('display_name', '')
+                    if real_name:
+                        self._slack_user_cache[real_name.lower()] = user_id
+                    if display_name:
+                        self._slack_user_cache[display_name.lower()] = user_id
+                cursor = response.get('response_metadata', {}).get('next_cursor')
+                if not cursor:
+                    break
         except SlackApiError as e:
             print(f'Failed to fetch Slack users: {e}')
 
     def _get_slack_mention(self, username: str) -> str:
-        user_id = self._slack_user_cache.get(username.lower())
+        lower = username.lower()
+        user_id = (
+            self._slack_user_cache.get(lower)  # "Name Surname" format
+            or self._slack_user_cache.get(lower.replace(' ', '.'))  # "name.surname" format
+        )
         return f'<@{user_id}>' if user_id else username
 
     def _notify_slack_low_utilization(self, sessions: List[InteractiveSession]) -> None:
@@ -284,13 +293,20 @@ class WorkersMonitor:
         if not low_sessions:
             return
 
+        # Sort sessions by avg GPU usage ascending, then by running time descending
+        low_sessions.sort(key=lambda s: (s.avg_gpu_usage, -s.running_time_days))
+
         lines = [
-            f'*Low GPU utilization alert* — sessions below {self._low_gpu_threshold:.0f}% avg GPU usage (7-day avg):']
+            f'Sessions below {self._low_gpu_threshold:.0f}% avg GPU (7-day avg):'
+        ]
         for s in low_sessions:
             mention = self._get_slack_mention(s.username)
             lines.append(
-                f'• {mention} — Task `{s.task_id[:16]}...` on `{s.queue}` — Avg GPU: {s.avg_gpu_usage:.1f}% — Running: {s.running_time_days:.2f} days'
+                f'• {mention} — `{s.task_id[:8]}...` on `{s.queue}` — *{s.avg_gpu_usage:.1f}%* GPU — {s.running_time_days:.0f}d running'
             )
+        lines.append(
+            '\n If you\'re not actively using your session, please consider terminating it to free up GPU resources for others. Thank you! 🙏'
+        )
 
         try:
             print('Posting Slack alert:\n' + '\n'.join(lines))
@@ -486,14 +502,10 @@ def main() -> None:
     parser.add_argument('--config', type=str, help='Config', required=True)
     parser.add_argument('--slack-token', type=str, help='Slack bot token', default=None)
     parser.add_argument('--slack-channel', type=str, help='Slack channel to post alerts to', default=None)
-    parser.add_argument('--gpu-threshold', type=float, help='Avg GPU usage %% below which a session is alerted',
-                        default=20.0)
-    parser.add_argument('--slack-notify-hour', type=int,
-                        help='UTC hour (0-23) at which to send the Slack alert (default: 12)', default=12)
-    parser.add_argument('--slack-notify-weekday', type=int,
-                        help='Weekday to notify on (0=Mon…6=Sun); default: 0 (Monday)', default=0)
-    parser.add_argument('--min-session-days', type=float, default=1.0,
-                        help='Minimum session age in days before it is eligible for Slack alerting (default: 1.0)')
+    parser.add_argument('--slack-notify-hour', type=int, help='UTC hour (0-23) at which to send the Slack alert (default: 12)', default=12)
+    parser.add_argument('--slack-notify-weekday', type=int, help='Weekday to notify on (0=Mon…6=Sun); default: 0 (Monday)', default=0)
+    parser.add_argument('--gpu-threshold', type=float, help='Avg GPU usage %% below which a session is alerted', default=10.0)
+    parser.add_argument('--min-session-days', type=float, default=2.0, help='Minimum session age in days before it is eligible for Slack alerting (default: 2.0)')
     args = parser.parse_args()
     # fmt: on
 
