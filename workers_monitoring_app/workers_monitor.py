@@ -509,9 +509,9 @@ def main() -> None:
     args = parser.parse_args()
     # fmt: on
 
-    cfg = json.loads(json.loads(args.config))
+    cfg = json.loads(args.config)
 
-    task = Task.init(project_name='DevOps', task_name='Workers monitor (TMP VUSAL)', task_type=TaskTypes.monitor)
+    task = Task.init(project_name='DevOps', task_name='Workers monitor', task_type=TaskTypes.monitor)
     task.connect(cfg)
 
     slack_client = WebClient(token=args.slack_token) if args.slack_token else None
