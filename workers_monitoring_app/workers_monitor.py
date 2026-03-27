@@ -57,6 +57,7 @@ class WorkersMonitor:
         self._slack_last_notified_date: Optional[date] = None
         self._slack_user_cache: Dict[str, str] = {}
         if self._slack_client:
+            print('Initializing Slack user cache...')
             self._init_slack_user_cache()
 
     def monitor(self, pool_period: float = 60.0) -> None:
@@ -90,6 +91,7 @@ class WorkersMonitor:
             interactive_sessions = self._identify_interactive_sessions(workers)
             self._report_interactive_sessions(interactive_sessions)
             if self._slack_client and self._slack_channel and self._should_notify_slack_now():
+                print('Conditions met for sending Slack notification about low-utilization sessions.')
                 self._notify_slack_low_utilization(interactive_sessions)
 
             usage_by_user = self._collect_usage_by_user(workers)
@@ -291,6 +293,7 @@ class WorkersMonitor:
             if s.running_time_days >= self._min_session_days and 0 <= s.avg_gpu_usage < self._low_gpu_threshold
         ]
         if not low_sessions:
+            print('No low-utilization sessions found for Slack notification.')
             return
 
         # Sort sessions by avg GPU usage ascending, then by running time descending
@@ -510,6 +513,9 @@ def main() -> None:
     # fmt: on
 
     cfg = json.loads(args.config)
+
+    print('Loaded config:')
+    print(json.dumps(cfg, indent=2))
 
     task = Task.init(project_name='DevOps', task_name='Workers monitor', task_type=TaskTypes.monitor)
     task.connect(cfg)
