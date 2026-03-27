@@ -512,10 +512,12 @@ def main() -> None:
     args = parser.parse_args()
     # fmt: on
 
-    cfg = json.loads(args.config)
+    # print args for debugging
+    print('Arguments:')
+    for arg_name, arg_value in vars(args).items():
+        print(f'  {arg_name}: {arg_value}')
 
-    print('Loaded config:')
-    print(json.dumps(cfg, indent=2))
+    cfg = json.loads(args.config)
 
     task = Task.init(project_name='DevOps', task_name='Workers monitor', task_type=TaskTypes.monitor)
     task.connect(cfg)
