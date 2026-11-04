@@ -1,0 +1,2 @@
+# Deployment config with environment-specific values; see the .example file
+list_dataset_updater_app/*.app.conf
